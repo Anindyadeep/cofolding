@@ -142,6 +142,51 @@ def parse_status(spec: str) -> set[str] | None:
     return {s.strip() for s in spec.split(",") if s.strip()}
 
 
+def norm_met_name(name: str) -> str:
+    s = (name or "").strip().lower()
+    s = re.sub(r"\([^)]*\)", "", s)
+    return re.sub(r"\s+", "", s)
+
+
+def parse_names(spec: str | None) -> list[str] | None:
+    if spec is None:
+        return None
+    parts = [p.strip() for p in spec.split(",") if p.strip()]
+    return parts or None
+
+
+def load_metabolite_catalog(met_rows: list[dict]) -> list[dict]:
+    catalog = []
+    for idx, row in enumerate(met_rows):
+        name = (row.get("updated_name") or "").strip()
+        smiles = (row.get("updated_smiles") or "").strip()
+        st = (row.get("status") or "").strip()
+        if not name or not smiles:
+            continue
+        catalog.append({"id": idx, "name": name, "smiles": smiles, "status": st})
+    return catalog
+
+
+def select_named_metabolites(catalog: list[dict], names: list[str],
+                             wanted_status: set[str] | None) -> list[dict]:
+    selected, used = [], set()
+    for query in names:
+        qn = norm_met_name(query)
+        hits = [m for m in catalog if norm_met_name(m["name"]) == qn]
+        if wanted_status is not None:
+            hits = [m for m in hits if m["status"] in wanted_status]
+        if not hits:
+            close = [m["name"] for m in catalog
+                     if qn in norm_met_name(m["name"]) or norm_met_name(m["name"]).startswith(qn)]
+            hint = f" (close: {', '.join(close[:8])})" if close else ""
+            die(f"no metabolite matching {query!r}{hint}")
+        for m in hits:
+            if m["id"] not in used:
+                selected.append(m)
+                used.add(m["id"])
+    return selected
+
+
 def heavy_atoms(smiles: str) -> int:
     """Rough non-hydrogen atom count, good enough for size-ordering ligands."""
     bracket = re.findall(r"\[([^\]]+)\]", smiles)
@@ -252,7 +297,14 @@ def select_proteins(rows: list[dict], per_tier: dict[str, int]) -> list[dict]:
     return chosen
 
 
-def select_metabolites(rows: list[dict], count: int, status: str) -> list[dict]:
+def select_metabolites(rows: list[dict], count: int, status: str,
+                       names: list[str] | None = None) -> list[dict]:
+    catalog = load_metabolite_catalog(rows)
+    wanted = parse_status(status)
+    if names:
+        picked = select_named_metabolites(catalog, names, wanted)
+        by_id = {m["id"]: rows[m["id"]] for m in picked}
+        return [by_id[m["id"]] for m in picked]
     pool = [r for r in rows if (r.get("status") or "").strip() == status
             and (r.get("updated_name") or "").strip() and (r.get("updated_smiles") or "").strip()]
     ranked = sorted(pool, key=lambda r: (heavy_atoms(r["updated_smiles"]), r["updated_name"]))
@@ -266,7 +318,8 @@ def cmd_subset(args: argparse.Namespace) -> None:
 
     per_tier = {"small": args.small, "mid": args.mid, "big": args.big, "supra": args.supra}
     proteins = select_proteins(seq_rows, per_tier)
-    metabolites = select_metabolites(met_rows, args.metabolites_count, args.status)
+    metabolites = select_metabolites(met_rows, args.metabolites_count, args.status,
+                                     parse_names(args.names))
 
     write_tsv(Path(args.out_sequences), seq_fields, proteins)
     write_tsv(Path(args.out_metabolites), met_fields, metabolites)
@@ -457,26 +510,30 @@ def write_yaml(path: Path, sequence: str, smiles: str, msa_path: str) -> None:
 
 
 def build_plan(work: Work, batch_size_override: int | None, cp_size: int,
-               force_serial: bool, allow_missing_msa: bool, status: str = "all") -> dict:
+               force_serial: bool, allow_missing_msa: bool, status: str = "all",
+               names: str | None = None) -> dict:
     section("Planning co-folding jobs")
     _, seq_rows = read_tsv(work.sequences)
     _, met_rows = read_tsv(work.metabolites)
 
+    catalog = load_metabolite_catalog(met_rows)
+    write_json(work.outputs / "metabolites_index.json", catalog)
+
     wanted = parse_status(status)
-    metabolites = []
-    for idx, row in enumerate(met_rows):
-        name = (row.get("updated_name") or "").strip()
-        smiles = (row.get("updated_smiles") or "").strip()
-        st = (row.get("status") or "").strip()
-        if not name or not smiles:
-            continue
-        if wanted is not None and st not in wanted:
-            continue
-        metabolites.append({"id": idx, "name": name, "smiles": smiles, "status": st})
+    name_list = parse_names(names)
+    if name_list:
+        metabolites = select_named_metabolites(catalog, name_list, wanted)
+    elif wanted is None:
+        metabolites = catalog
+    else:
+        metabolites = [m for m in catalog if m["status"] in wanted]
     if not metabolites:
-        die(f"no metabolites match --status {status!r}")
-    info(f"metabolites selected: {len(metabolites)} (status={status})")
-    write_json(work.outputs / "metabolites_index.json", metabolites)
+        die(f"no metabolites match --status {status!r}"
+            + (f" --names {names!r}" if names else ""))
+    info(f"metabolites selected: {len(metabolites)}  "
+         f"(status={status}, names={names or 'all'}, order={'given' if name_list else 'tsv'})")
+    for m in metabolites:
+        info(f"  id={m['id']:<4} {m['name']:<28} [{m['status']}]")
 
     proteins, skipped = [], []
     for row in seq_rows:
@@ -501,9 +558,10 @@ def build_plan(work: Work, batch_size_override: int | None, cp_size: int,
     if not use_cp and any(p["tier"] == "supra" for p in proteins):
         warn("Boltz-CP unavailable or <%d GPUs: supra proteins routed to serial (may OOM)" % cp_size)
 
+    proteins_sorted = sorted(proteins, key=lambda x: (TIER_ORDER.index(x["tier"]), x["length"], x["acc"]))
     jobs: list[dict] = []
-    for p in sorted(proteins, key=lambda x: (TIER_ORDER.index(x["tier"]), x["length"], x["acc"])):
-        for m in metabolites:
+    for m in metabolites:
+        for p in proteins_sorted:
             route = "cp" if (p["tier"] == "supra" and use_cp) else "serial"
             job_id = f"{slug(p['acc'], 20)}__m{m['id']:02d}"
             yaml_path = work.configs / p["tier"] / f"{job_id}.yaml"
@@ -518,40 +576,44 @@ def build_plan(work: Work, batch_size_override: int | None, cp_size: int,
                 "_seq": p["seq"],
             })
 
-    # Group jobs into per-GPU batches, keeping each batch inside one tier.
+    # One metabolite at a time, then by tier, so ATP can finish before GTP etc.
     batches: list[dict] = []
     seq_no = 0
-    for tier in TIER_ORDER:
-        tier_jobs = [j for j in jobs if j["tier"] == tier]
-        size = batch_size_override or TIER_BATCH[tier]
-        if tier == "supra":
-            size = 1
-        for start in range(0, len(tier_jobs), size):
-            seq_no += 1
-            chunk = tier_jobs[start:start + size]
-            batch_id = f"batch_{seq_no:05d}_{tier}"
-            config_dir = work.configs / tier / batch_id
-            config_dir.mkdir(parents=True, exist_ok=True)
-            for j in chunk:
-                dest = config_dir / f"{j['job_id']}.yaml"
-                write_yaml(dest, j["_seq"], j["smiles"], j["msa"])
-                j["input_yaml"] = str(dest)
-                j["batch_id"] = batch_id
-            batches.append({
-                "batch_id": batch_id, "tier": tier, "route": chunk[0]["route"],
-                "resources": cp_size if chunk[0]["route"] == "cp" else 1,
-                "config_dir": str(config_dir),
-                "out_dir": str(work.boltz_run_cache / batch_id),
-                "job_ids": [j["job_id"] for j in chunk],
-            })
+    for m in metabolites:
+        for tier in TIER_ORDER:
+            tier_jobs = [j for j in jobs if j["metabolite_id"] == m["id"] and j["tier"] == tier]
+            size = batch_size_override or TIER_BATCH[tier]
+            if tier == "supra":
+                size = 1
+            for start in range(0, len(tier_jobs), size):
+                seq_no += 1
+                chunk = tier_jobs[start:start + size]
+                batch_id = f"batch_{seq_no:05d}_{slug(m['name'], 16)}_{tier}"
+                config_dir = work.configs / tier / batch_id
+                config_dir.mkdir(parents=True, exist_ok=True)
+                for j in chunk:
+                    dest = config_dir / f"{j['job_id']}.yaml"
+                    write_yaml(dest, j["_seq"], j["smiles"], j["msa"])
+                    j["input_yaml"] = str(dest)
+                    j["batch_id"] = batch_id
+                batches.append({
+                    "batch_id": batch_id, "tier": tier, "route": chunk[0]["route"],
+                    "metabolite_id": m["id"], "metabolite_name": m["name"],
+                    "resources": cp_size if chunk[0]["route"] == "cp" else 1,
+                    "config_dir": str(config_dir),
+                    "out_dir": str(work.boltz_run_cache / batch_id),
+                    "job_ids": [j["job_id"] for j in chunk],
+                })
 
     for j in jobs:
         j.pop("_seq", None)
     plan = {
         "created_at": now_iso(), "workdir": str(work.root),
         "proteins": len(proteins), "metabolites": len(metabolites),
+        "metabolite_names": [m["name"] for m in metabolites],
         "jobs": len(jobs), "batches": len(batches), "skipped": len(skipped),
         "cp_size": cp_size, "use_cp": use_cp, "tier_bounds": TIER_BOUNDS,
+        "status": status, "names": names,
     }
     write_json(work.queue / "jobs.json", jobs)
     write_json(work.queue / "batches.json", batches)
@@ -570,7 +632,8 @@ def cmd_plan(args: argparse.Namespace) -> None:
     work.make_tree()
     shutil.copyfile(args.sequences, work.sequences)
     shutil.copyfile(args.metabolites, work.metabolites)
-    build_plan(work, args.batch_size, args.cp_size, args.force_serial, args.allow_missing_msa, args.status)
+    build_plan(work, args.batch_size, args.cp_size, args.force_serial, args.allow_missing_msa,
+               args.status, args.names)
 
 
 # --------------------------------------------------------------------------- #
@@ -853,7 +916,8 @@ def cmd_all(args: argparse.Namespace) -> None:
             download_msa_targeted(work, accs, args.hf_token or os.environ.get("HF_TOKEN"))
     shutil.copyfile(args.sequences, work.sequences)
     shutil.copyfile(args.metabolites, work.metabolites)
-    build_plan(work, args.batch_size, args.cp_size, args.force_serial, allow_missing_msa=False, status=args.status)
+    build_plan(work, args.batch_size, args.cp_size, args.force_serial, allow_missing_msa=False,
+               status=args.status, names=args.names)
 
     batches = load_json(work.queue / "batches.json")
     jobs_by_id = {j["job_id"]: j for j in load_json(work.queue / "jobs.json")}
@@ -869,6 +933,14 @@ def cmd_all(args: argparse.Namespace) -> None:
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
+def _add_met_select(p: argparse.ArgumentParser, status_default: str) -> None:
+    p.add_argument("--status", default=status_default,
+                   help="metabolites to fold: core | non | all | comma-list")
+    p.add_argument("--names", default=None,
+                   help="comma-separated metabolite names, run in this order "
+                        "(ATP matches ATP(4-), not dATP). e.g. ATP,GTP,NAD+,NADH")
+
+
 def _add_boltz_run_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--recycling-steps", type=int, default=3, dest="recycling_steps")
     p.add_argument("--sampling-steps", type=int, default=200, dest="sampling_steps")
@@ -892,7 +964,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--big", type=int, default=12)
     sp.add_argument("--supra", type=int, default=8)
     sp.add_argument("--metabolites-count", type=int, default=5)
-    sp.add_argument("--status", default="core")
+    _add_met_select(sp, "core")
     sp.set_defaults(func=cmd_subset)
 
     sp = sub.add_parser("setup", help="repos, venvs, weights")
@@ -915,7 +987,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--metabolites", required=True)
     sp.add_argument("--batch-size", type=int, default=None, help="override per-GPU batch size")
     sp.add_argument("--cp-size", type=int, default=4)
-    sp.add_argument("--status", default="all", help="metabolites to fold: core | non | all | comma-list")
+    _add_met_select(sp, "all")
     sp.add_argument("--force-serial", action="store_true")
     sp.add_argument("--allow-missing-msa", action="store_true")
     sp.set_defaults(func=cmd_plan)
@@ -954,7 +1026,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--msa-mode", choices=["full", "targeted"], default="full")
     sp.add_argument("--batch-size", type=int, default=None)
     sp.add_argument("--cp-size", type=int, default=4)
-    sp.add_argument("--status", default="all", help="metabolites to fold: core | non | all | comma-list")
+    _add_met_select(sp, "all")
     sp.add_argument("--force-serial", action="store_true")
     sp.add_argument("--boltz-src", default=None)
     sp.add_argument("--boltz-cp-src", default=None)
